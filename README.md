@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🏦 PwC UK — Enterprise Core Banking Cloud Transformation
+# 🏦 UK — Enterprise Core Banking Cloud Transformation
 
 [![Azure](https://img.shields.io/badge/Azure-AKS%20%7C%20SQL%20%7C%20Service%20Bus%20%7C%20Key%20Vault-0078D4?style=for-the-badge&logo=microsoft-azure&logoColor=white)](https://azure.microsoft.com)
 [![Azure DevOps](https://img.shields.io/badge/Azure%20DevOps-Pipelines%20%7C%20VMSS%20Agents-0078D4?style=for-the-badge&logo=azure-devops&logoColor=white)](https://dev.azure.com)
