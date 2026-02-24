@@ -1,0 +1,135 @@
+# =============================================================================
+# Azure DevOps — Build & Deploy Pipeline
+# LESSONS APPLIED:
+#   Issue #3 — Docker layer caching (queue time 140min → 12min)
+#   Issue #2 — Azure Policy pre-check before any kubectl command
+#   Issue #6 — Pre-flight: verify AKS API server reachable before deploying
+#   Issue #4 — WIF Service Connections (no secrets to rotate or expire)
+# =============================================================================
+
+trigger:
+  branches:
+    include: [main, develop]
+
+variables:
+  - group: core-banking-prod-vars
+  - name: containerRegistry
+    value: bankcoreacrprod.azurecr.io
+  - name: imageRepository
+    value: core-banking-api
+  - name: tag
+    value: "$(Build.SourceVersion)"  # SHA — NEVER 'latest' in prod
+
+pool:
+  name: CoreBanking-SelfHosted  # Self-hosted — accesses private AKS/ACR/KeyVault
+
+stages:
+
+  # Stage 1: Fast validation — fail fast before expensive Docker build
+  - stage: Validate
+    displayName: "Lint & Helm Validate"
+    jobs:
+      - job: LintAndTest
+        steps:
+          - task: UsePythonVersion@0
+            inputs: { versionSpec: "3.11" }
+          - script: |
+              pip install -r requirements.txt -r requirements-dev.txt
+              ruff check .
+              pytest tests/unit/ --cov=src --cov-fail-under=80
+            displayName: "Lint & Unit Tests"
+
+      - job: HelmValidate
+        steps:
+          - task: HelmInstaller@1
+            inputs: { helmVersionToInstall: "3.13.2" }
+          - script: |
+              helm lint kubernetes/helm/core-banking-api \
+                -f kubernetes/helm/core-banking-api/values-prod.yaml
+              # kubeval catches schema renames before ArgoCD deploys (Issue #4 lesson)
+              helm template core-banking-api kubernetes/helm/core-banking-api \
+                -f kubernetes/helm/core-banking-api/values-prod.yaml | kubeval --strict
+            displayName: "Helm lint + kubeval"
+
+  # Stage 2: Build with Docker layer caching
+  # LESSON (Issue #3): No caching = agents pulling 2.3GB base image every build
+  - stage: Build
+    dependsOn: Validate
+    jobs:
+      - job: BuildAndPush
+        steps:
+          - task: AzureCLI@2
+            displayName: "Docker build with cache"
+            inputs:
+              azureSubscription: "CoreBanking-Prod-WIF"  # WIF — no SP secret (Issue #4)
+              scriptType: bash
+              inlineScript: |
+                az acr login --name bankcoreacrprod
+                DOCKER_BUILDKIT=1 docker build \
+                  --cache-from type=registry,ref=bankcoreacrprod.azurecr.io/build-cache:core-banking \
+                  --cache-to type=registry,ref=bankcoreacrprod.azurecr.io/build-cache:core-banking,mode=max \
+                  --tag bankcoreacrprod.azurecr.io/core-banking-api:$(tag) \
+                  -f Dockerfile .
+                docker push bankcoreacrprod.azurecr.io/core-banking-api:$(tag)
+
+  # Stage 3: Azure Policy pre-check
+  # LESSON (Issue #2): Central team applied Deny policy with no notice.
+  # All deployments hit ImagePullBackOff. FCA hotfix blocked.
+  # Pre-check catches this BEFORE kubectl/helm runs.
+  - stage: PolicyPreflight
+    dependsOn: Build
+    jobs:
+      - job: PolicyCheck
+        steps:
+          - task: AzureCLI@2
+            displayName: "Azure Policy compliance check"
+            inputs:
+              azureSubscription: "CoreBanking-Prod-WIF"
+              scriptType: bash
+              inlineScript: |
+                NON_COMPLIANT=$(az policy state list \
+                  --resource-group rg-corebanking-prod \
+                  --filter "complianceState eq 'NonCompliant'" \
+                  --query "length(@)" -o tsv)
+                echo "Non-compliant policy states: $NON_COMPLIANT"
+                if [ "$NON_COMPLIANT" -gt "10" ]; then
+                  echo "##vso[task.logissue type=error]High non-compliance — investigate before deploying"
+                  exit 1
+                fi
+
+          - task: Kubernetes@1
+            displayName: "Pre-flight — AKS API server reachable"
+            # LESSON (Issue #6): NSG change made API server unreachable.
+            # Without this, engineers discover the problem 8 minutes into deploy.
+            inputs:
+              connectionType: "Azure Resource Manager"
+              azureSubscriptionEndpoint: "CoreBanking-Prod-WIF"
+              azureResourceGroup: "rg-corebanking-prod"
+              kubernetesCluster: "aks-corebanking-prod"
+              command: get
+              arguments: "nodes --request-timeout=10s"
+
+  # Stage 4: Deploy
+  - stage: DeployProd
+    dependsOn: PolicyPreflight
+    jobs:
+      - deployment: DeployToProd
+        environment: "production"
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: HelmDeploy@0
+                  inputs:
+                    connectionType: "Azure Resource Manager"
+                    azureSubscriptionEndpoint: "CoreBanking-Prod-WIF"
+                    azureResourceGroup: "rg-corebanking-prod"
+                    kubernetesCluster: "aks-corebanking-prod"
+                    namespace: core-banking
+                    command: upgrade
+                    chartType: FilePath
+                    chartPath: kubernetes/helm/core-banking-api
+                    releaseName: core-banking-api
+                    overrideValues: "image.tag=$(tag)"
+                    valueFile: kubernetes/helm/core-banking-api/values-prod.yaml
+                    arguments: "--atomic --timeout 15m"

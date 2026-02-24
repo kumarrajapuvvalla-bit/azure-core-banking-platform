@@ -1,0 +1,101 @@
+# =============================================================================
+# LESSON (Issue #5): Core banking transaction processor had replicas: 1 and
+# no PDB. AKS node drain during OS patch evicted the pod immediately.
+# 4-minute transaction processing downtime. Severity-2. CTO review.
+# Now: every critical service has PDB + multi-replica + AZ spread.
+# OPA Gatekeeper rejects replicas < 2 at admission webhook.
+# =============================================================================
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: core-banking-api-pdb
+  namespace: core-banking
+  annotations:
+    description: "Added Month 8 after single-replica pod eviction caused 4-min payment outage"
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: core-banking-api
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: txn-processor-pdb
+  namespace: core-banking
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: txn-processor
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: banking-critical
+value: 100000
+globalDefault: false
+description: "Core banking payment path. Never evicted under node pressure."
+
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: system-critical
+value: 1000000
+globalDefault: false
+description: "Prometheus, Grafana, Fluent Bit. Never evicted."
+
+---
+# Example Deployment with all safety controls from incidents applied
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: core-banking-api
+  namespace: core-banking
+spec:
+  replicas: 3  # NEVER 1 in production — OPA enforces this
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero-downtime rolling update
+  selector:
+    matchLabels:
+      app: core-banking-api
+  template:
+    metadata:
+      labels:
+        app: core-banking-api
+    spec:
+      priorityClassName: banking-critical
+      # Spread across availability zones — survive a full AZ failure
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: core-banking-api
+      containers:
+        - name: core-banking-api
+          image: bankcoreacrprod.azurecr.io/core-banking-api:PLACEHOLDER
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 20
+            periodSeconds: 10
