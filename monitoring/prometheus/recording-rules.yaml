@@ -1,0 +1,195 @@
+###############################################################
+# monitoring/prometheus/recording-rules.yaml
+# Prometheus recording rules — pre-compute expensive queries
+#
+# Recording rules reduce dashboard load time and alert evaluation
+# cost. All frequently-used rate/ratio calculations are pre-computed
+# at 1-minute resolution and stored as new time series.
+#
+# Naming convention: <namespace>:<metric>:<aggregation>
+###############################################################
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: banking-recording-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: banking-platform
+    release: prometheus-stack
+spec:
+  groups:
+    ##########################################################
+    # Service Level Indicator (SLI) recording rules
+    # Used by SLO dashboards and multi-window burn rate alerts
+    ##########################################################
+    - name: banking.sli.rules
+      interval: 1m
+      rules:
+        # Request success rate — 5m window
+        - record: banking:http_request_success_rate:5m
+          expr: |
+            sum(rate(http_requests_total{
+              job=~"banking-api|payment-service",
+              status!~"5.."
+            }[5m])) by (job, namespace)
+            /
+            sum(rate(http_requests_total{
+              job=~"banking-api|payment-service"
+            }[5m])) by (job, namespace)
+
+        # Request success rate — 1h window (for SLO burn rate)
+        - record: banking:http_request_success_rate:1h
+          expr: |
+            sum(rate(http_requests_total{
+              job=~"banking-api|payment-service",
+              status!~"5.."
+            }[1h])) by (job, namespace)
+            /
+            sum(rate(http_requests_total{
+              job=~"banking-api|payment-service"
+            }[1h])) by (job, namespace)
+
+        # Request success rate — 6h window
+        - record: banking:http_request_success_rate:6h
+          expr: |
+            sum(rate(http_requests_total{
+              job=~"banking-api|payment-service",
+              status!~"5.."
+            }[6h])) by (job, namespace)
+            /
+            sum(rate(http_requests_total{
+              job=~"banking-api|payment-service"
+            }[6h])) by (job, namespace)
+
+        # Payment transaction throughput (TPS)
+        - record: banking:payment_transaction_rate:5m
+          expr: |
+            sum(rate(banking_transactions_total{
+              type="payment"
+            }[5m])) by (status, namespace)
+
+        # Payment error rate
+        - record: banking:payment_error_rate:5m
+          expr: |
+            sum(rate(banking_transactions_total{
+              type="payment",
+              status="error"
+            }[5m])) by (namespace)
+            /
+            sum(rate(banking_transactions_total{
+              type="payment"
+            }[5m])) by (namespace)
+
+        # API latency percentiles — pre-computed for fast dashboards
+        - record: banking:http_request_duration_p50:5m
+          expr: |
+            histogram_quantile(0.50,
+              sum(rate(http_request_duration_seconds_bucket{
+                job=~"banking-api|payment-service"
+              }[5m])) by (job, le)
+            )
+
+        - record: banking:http_request_duration_p95:5m
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(http_request_duration_seconds_bucket{
+                job=~"banking-api|payment-service"
+              }[5m])) by (job, le)
+            )
+
+        - record: banking:http_request_duration_p99:5m
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{
+                job=~"banking-api|payment-service"
+              }[5m])) by (job, le)
+            )
+
+    ##########################################################
+    # Infrastructure recording rules
+    ##########################################################
+    - name: banking.infra.rules
+      interval: 1m
+      rules:
+        # Node CPU utilisation per node
+        - record: node:cpu_utilisation:avg5m
+          expr: |
+            1 - avg(rate(node_cpu_seconds_total{
+              mode="idle"
+            }[5m])) by (node)
+
+        # Node memory utilisation
+        - record: node:memory_utilisation:ratio
+          expr: |
+            1 - (
+              node_memory_MemAvailable_bytes
+              /
+              node_memory_MemTotal_bytes
+            )
+
+        # Pod CPU utilisation as fraction of limit
+        - record: pod:cpu_utilisation_vs_limit:ratio
+          expr: |
+            sum(rate(container_cpu_usage_seconds_total{
+              namespace="banking",
+              container!=""
+            }[5m])) by (pod, container, namespace)
+            /
+            sum(kube_pod_container_resource_limits{
+              namespace="banking",
+              resource="cpu"
+            }) by (pod, container, namespace)
+
+        # Pod memory utilisation as fraction of limit
+        - record: pod:memory_utilisation_vs_limit:ratio
+          expr: |
+            sum(container_memory_working_set_bytes{
+              namespace="banking",
+              container!=""
+            }) by (pod, container, namespace)
+            /
+            sum(kube_pod_container_resource_limits{
+              namespace="banking",
+              resource="memory"
+            }) by (pod, container, namespace)
+
+        # AKS node pool readiness ratio
+        - record: aks:node_readiness_ratio:cluster
+          expr: |
+            sum(kube_node_status_condition{condition="Ready",status="true"})
+            /
+            sum(kube_node_info)
+
+    ##########################################################
+    # SLO burn rate rules (multi-window, multi-burn-rate)
+    # Based on Google SRE error budget alerting
+    ##########################################################
+    - name: banking.slo.burnrate
+      interval: 1m
+      rules:
+        # SLO target: 99.9% success rate (FCA-aligned)
+        # Error budget: 0.1% = 43.8 minutes/month
+
+        # Fast burn: 14x rate over 1h/5m windows
+        - record: banking:slo:fast_burn_rate
+          expr: |
+            (1 - banking:http_request_success_rate:5m) / (1 - 0.999)
+
+        # Slow burn: 2x rate over 6h/1h windows
+        - record: banking:slo:slow_burn_rate
+          expr: |
+            (1 - banking:http_request_success_rate:6h) / (1 - 0.999)
+
+        # Error budget remaining (30-day window)
+        - record: banking:slo:error_budget_remaining:30d
+          expr: |
+            1 - (
+              sum(increase(http_requests_total{
+                job=~"banking-api|payment-service",
+                status=~"5.."
+              }[30d]))
+              /
+              sum(increase(http_requests_total{
+                job=~"banking-api|payment-service"
+              }[30d]))
+            ) / (1 - 0.999)
