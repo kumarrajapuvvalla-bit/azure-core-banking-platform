@@ -1,0 +1,236 @@
+###############################################################
+# kubernetes/deployments/payment-service-deployment.yaml
+# Payment Processing Microservice — Production Deployment
+#
+# Responsibilities:
+#   - Validate and route incoming payment instructions
+#   - Publish validated transactions to Azure Service Bus
+#   - Enforce idempotency via Redis-backed deduplication
+#
+# FCA: Any payment processing outage is a P0 incident
+# PCI-DSS: No cardholder data stored in pod memory/disk
+###############################################################
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: banking
+  labels:
+    app.kubernetes.io/name: payment-service
+    app.kubernetes.io/version: "2.1.0"
+    app.kubernetes.io/component: payment-processor
+    app.kubernetes.io/part-of: core-banking
+    app.kubernetes.io/managed-by: Helm
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    prometheus.io/scrape: "true"
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0    # Zero downtime — FCA requirement
+      maxSurge: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: payment-service
+        app.kubernetes.io/version: "2.1.0"
+        azure.workload.identity/use: "true"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: payment-service-sa
+      automountServiceAccountToken: true
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        fsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Hard anti-affinity: no two replicas on the same node
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: payment-service
+              topologyKey: kubernetes.io/hostname
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: payment-service
+                topologyKey: topology.kubernetes.io/zone
+
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: payment-service
+
+      containers:
+        - name: payment-service
+          image: acrpwcbankingprod.azurecr.io/payment-service:IMAGE_TAG
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+
+          env:
+            - name: ENVIRONMENT
+              value: production
+            - name: PORT
+              value: "8081"
+            - name: LOG_LEVEL
+              value: WARNING
+            - name: SERVICE_BUS_NAMESPACE
+              value: sb-pwc-banking-prod.servicebus.windows.net
+            - name: PAYMENT_QUEUE_NAME
+              value: payment-instructions
+            - name: IDEMPOTENCY_CACHE_TTL_SECONDS
+              value: "86400"  # 24h — covers same-day payment deduplication window
+            - name: MAX_PAYMENT_AMOUNT_GBP
+              value: "250000"  # PCI-DSS transaction limit
+            - name: AZURE_CLIENT_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['azure.workload.identity/client-id']
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "1Gi"
+
+          lifecycle:
+            preStop:
+              exec:
+                # Drain in-flight payment requests before pod termination
+                command: ["/bin/sh", "-c", "sleep 30"]
+
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+            timeoutSeconds: 5
+
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            failureThreshold: 3
+            timeoutSeconds: 3
+            # Note: readiness probe also validates Service Bus connectivity
+            # and Redis reachability to prevent routing to isolated pods
+
+          startupProbe:
+            httpGet:
+              path: /health/startup
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 30
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: secrets-store
+              mountPath: /mnt/secrets
+              readOnly: true
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: secrets-store
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: payment-service-kv-provider
+
+      terminationGracePeriodSeconds: 60
+      nodeSelector:
+        workload-type: application
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: payment-service-pdb
+  namespace: banking
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: payment-service
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: payment-service-sa
+  namespace: banking
+  annotations:
+    azure.workload.identity/client-id: "PAYMENT_SERVICE_CLIENT_ID"
+    azure.workload.identity/tenant-id: "TENANT_ID"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: banking
+  labels:
+    app.kubernetes.io/name: payment-service
+  annotations:
+    prometheus.io/scrape: "true"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: payment-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP
