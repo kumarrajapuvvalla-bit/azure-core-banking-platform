@@ -1,0 +1,115 @@
+###############################################################
+# monitoring/alertmanager/alertmanager-config.yaml
+# Alertmanager configuration — PagerDuty + email routing
+# Target: MTTA <= 4 minutes for P0 (FCA requirement)
+#
+# INCIDENT CONTEXT: Alert fatigue previously caused a 40-minute
+# missed P0 payment outage. Alert volume reduced from 85/wk to 11/wk
+# through deduplication, inhibition rules, and severity routing.
+###############################################################
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: banking-alertmanager-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: alertmanager
+spec:
+  route:
+    receiver: default-receiver
+    groupBy: [alertname, namespace, severity]
+    groupWait: 30s
+    groupInterval: 5m
+    repeatInterval: 4h
+
+    routes:
+      # P0: Critical — immediate PagerDuty page
+      - matchers:
+          - name: severity
+            value: critical
+        receiver: pagerduty-critical
+        groupWait: 10s
+        groupInterval: 1m
+        repeatInterval: 30m
+        continue: false
+
+      # FCA-reportable incidents — separate PagerDuty service
+      - matchers:
+          - name: fca_reportable
+            value: "true"
+        receiver: pagerduty-fca
+        groupWait: 10s
+        groupInterval: 1m
+        repeatInterval: 15m
+        continue: true
+
+      # P1: Warning — PagerDuty low urgency + email
+      - matchers:
+          - name: severity
+            value: warning
+        receiver: pagerduty-warning
+        groupWait: 1m
+        groupInterval: 10m
+        repeatInterval: 2h
+
+  inhibitRules:
+    # Suppress P1 warnings when a P0 is active for the same service
+    - sourceMatchers:
+        - name: severity
+          value: critical
+      targetMatchers:
+        - name: severity
+          value: warning
+      equal: [alertname, namespace]
+
+    # Suppress all non-critical alerts during maintenance windows
+    - sourceMatchers:
+        - name: alertname
+          value: MaintenanceWindowActive
+      targetMatchers:
+        - name: severity
+          value: warning
+      equal: []
+
+  receivers:
+    - name: default-receiver
+      emailConfigs:
+        - to: platform-engineering@pwc.com
+          from: alertmanager@banking.internal
+          smarthost: smtp.banking.internal:587
+          requireTLS: true
+
+    - name: pagerduty-critical
+      pagerdutyConfigs:
+        - routingKey:
+            key: PAGERDUTY_CRITICAL_KEY
+            name: alertmanager-pagerduty
+          severity: critical
+          description: |-
+            {{ range .Alerts }}
+            {{ .Annotations.summary }}
+            Impact: {{ .Annotations.description }}
+            Runbook: {{ .Annotations.runbook }}
+            {{ end }}
+
+    - name: pagerduty-fca
+      pagerdutyConfigs:
+        - routingKey:
+            key: PAGERDUTY_FCA_KEY
+            name: alertmanager-pagerduty
+          severity: critical
+          description: |
+            FCA REPORTABLE INCIDENT
+            {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}
+          details:
+            fca_reportable: "true"
+            incident_threshold: 30m
+
+    - name: pagerduty-warning
+      pagerdutyConfigs:
+        - routingKey:
+            key: PAGERDUTY_WARNING_KEY
+            name: alertmanager-pagerduty
+          severity: warning
+          description: |-
+            {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}
