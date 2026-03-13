@@ -1,0 +1,143 @@
+###############################################################
+# helm/banking-api/values.yaml
+# Default Helm values — override per environment
+###############################################################
+
+replicaCount: 3
+
+image:
+  repository: acrpwcbankingprod.azurecr.io/banking-api
+  pullPolicy: Always
+  tag: ""  # Set by CI/CD pipeline
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: banking-api-sa
+  annotations:
+    azure.workload.identity/client-id: ""
+    azure.workload.identity/tenant-id: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "9090"
+  prometheus.io/path: "/metrics"
+
+podLabels:
+  azure.workload.identity/use: "true"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+  metricsPort: 9090
+
+ingress:
+  enabled: true
+  className: azure/application-gateway
+  annotations:
+    appgw.ingress.kubernetes.io/ssl-redirect: "true"
+    appgw.ingress.kubernetes.io/use-private-ip: "true"
+    appgw.ingress.kubernetes.io/request-timeout: "30"
+  hosts:
+    - host: api.banking.internal
+      paths:
+        - path: /api/v1
+          pathType: Prefix
+        - path: /health
+          pathType: Prefix
+  tls:
+    - secretName: banking-api-tls
+      hosts:
+        - api.banking.internal
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  scaleUpStabilizationWindowSeconds: 60
+  scaleDownStabilizationWindowSeconds: 300
+
+pdb:
+  enabled: true
+  minAvailable: 2
+
+topologySpreadConstraints:
+  enabled: true
+  maxSkew: 1
+
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - topologyKey: kubernetes.io/hostname
+
+nodeSelector:
+  workload-type: application
+
+tolerations: []
+
+env:
+  LOG_LEVEL: INFO
+  PORT: "8080"
+  ENVIRONMENT: production
+
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 3
+  timeoutSeconds: 3
+
+keyVault:
+  enabled: true
+  name: kv-pwc-banking-prod-uks
+  secretProviderClass: banking-api-kv-provider
+
+networkPolicy:
+  enabled: true
+
+monitoring:
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    path: /metrics
+    port: metrics
+
+terminationGracePeriodSeconds: 60
