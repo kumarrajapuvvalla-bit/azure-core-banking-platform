@@ -1,0 +1,23 @@
+apiVersion: v2
+name: banking-api
+description: >
+  PwC UK Core Banking Platform — banking-api Helm chart.
+    Deploys to private AKS 1.28 with PDB, HPA, WIF, and OPA Gatekeeper enforcement.
+    type: application
+    version: 1.4.2
+    appVersion: "1.0.0"
+
+    keywords:
+      - banking
+        - azure
+          - aks
+            - devops
+
+            maintainers:
+              - name: Platform Engineering
+                  email: platform-engineering@pwc.com
+
+                  annotations:
+                    compliance/fca: "true"
+                      compliance/pci-dss: "true"
+                        compliance/iso27001: "true"
