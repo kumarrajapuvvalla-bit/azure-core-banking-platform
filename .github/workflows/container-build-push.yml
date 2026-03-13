@@ -1,0 +1,160 @@
+name: Container Build and Push
+
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service name to build (banking-api | payment-service | notification-service)
+        required: true
+        type: string
+      image_tag:
+        description: Docker image tag (defaults to commit SHA)
+        required: false
+        type: string
+        default: ""
+      push:
+        description: Push image to ACR (false for PR builds)
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      image-digest:
+        description: SHA256 digest of the pushed image
+        value: ${{ jobs.build-and-push.outputs.digest }}
+      image-tag:
+        description: Tag used for the image
+        value: ${{ jobs.build-and-push.outputs.tag }}
+      image-ref:
+        description: Full image reference (registry/name:tag)
+        value: ${{ jobs.build-and-push.outputs.ref }}
+
+  workflow_dispatch:
+    inputs:
+      service:
+        description: Service to build
+        required: true
+        type: choice
+        options: [banking-api, payment-service, notification-service]
+      push:
+        description: Push to ACR
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+  packages: write
+  attestations: write
+
+env:
+  REGISTRY: acrpwcbankingprod.azurecr.io
+
+jobs:
+  build-and-push:
+    name: Build ${{ inputs.service }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      tag: ${{ steps.tag.outputs.tag }}
+      ref: ${{ env.REGISTRY }}/${{ inputs.service }}:${{ steps.tag.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            TAG="${{ inputs.image_tag }}"
+          else
+            TAG="${GITHUB_SHA::12}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "Image tag: $TAG"
+
+      - name: Azure Login via OIDC (Workload Identity Federation)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Log in to Azure Container Registry
+        run: az acr login --name ${{ env.REGISTRY }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ inputs.service }}
+          tags: |
+            type=raw,value=${{ steps.tag.outputs.tag }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && inputs.push == 'true' }}
+            type=ref,event=branch
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=${{ inputs.service }}
+            org.opencontainers.image.description=PwC Banking Platform — ${{ inputs.service }}
+            org.opencontainers.image.vendor=PwC UK Platform Engineering
+            compliance.fca=true
+            compliance.pci-dss=true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: services/${{ inputs.service }}
+          file: services/${{ inputs.service }}/Dockerfile
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # BuildKit layer caching — reduces average build time by ~60%
+          cache-from: |
+            type=gha,scope=${{ inputs.service }}
+            type=registry,ref=${{ env.REGISTRY }}/${{ inputs.service }}:cache
+          cache-to: |
+            type=gha,mode=max,scope=${{ inputs.service }}
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            GIT_SHA=${{ github.sha }}
+            GIT_BRANCH=${{ github.ref_name }}
+            SERVICE_VERSION=${{ steps.tag.outputs.tag }}
+          provenance: true      # SLSA level 2 provenance attestation
+          sbom: true            # Generate SBOM for supply chain compliance
+
+      - name: Generate SBOM (Software Bill of Materials)
+        uses: anchore/sbom-action@v0
+        if: inputs.push
+        with:
+          image: ${{ env.REGISTRY }}/${{ inputs.service }}:${{ steps.tag.outputs.tag }}
+          format: spdx-json
+          output-file: ${{ inputs.service }}-sbom.spdx.json
+          artifact-name: ${{ inputs.service }}-sbom-${{ github.run_id }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        if: inputs.push
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ inputs.service }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Output image reference
+        run: |
+          echo "### Container Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | ${{ inputs.service }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | ${{ steps.tag.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Digest | ${{ steps.build.outputs.digest }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Pushed | ${{ inputs.push }} |" >> $GITHUB_STEP_SUMMARY
