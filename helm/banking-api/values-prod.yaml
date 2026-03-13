@@ -1,0 +1,46 @@
+# helm/banking-api/values-prod.yaml
+# Production overrides — applied on top of values.yaml
+# All production values are stricter than staging defaults
+
+replicaCount: 5
+
+resources:
+  requests:
+      cpu: 500m
+          memory: 512Mi
+            limits:
+                cpu: 2000m
+                    memory: 1Gi
+
+                    autoscaling:
+                      enabled: true
+                        minReplicas: 5
+                          maxReplicas: 30
+                            targetCPUUtilizationPercentage: 60
+                              targetMemoryUtilizationPercentage: 70
+
+                              pdb:
+                                enabled: true
+                                  minAvailable: 3
+
+                                  ingress:
+                                    hosts:
+                                        - host: api.banking.pwc.internal
+                                              paths:
+                                                      - path: /api/v1
+                                                                pathType: Prefix
+                                                                        - path: /health
+                                                                                  pathType: Prefix
+                                                                                    tls:
+                                                                                        - secretName: banking-api-tls-prod
+                                                                                              hosts:
+                                                                                                      - api.banking.pwc.internal
+                                                                                                      
+                                                                                                      keyVault:
+                                                                                                        name: kv-pwc-banking-prod-uks
+                                                                                                        
+                                                                                                        env:
+                                                                                                          LOG_LEVEL: WARN
+                                                                                                            ENVIRONMENT: production
+                                                                                                            
+                                                                                                            terminationGracePeriodSeconds: 120
