@@ -1,0 +1,19 @@
+{
+  "bindings": [
+    {
+      "name": "complianceTimer",
+      "type": "timerTrigger",
+      "direction": "in",
+      "schedule": "0 0 6 * * *",
+      "comment": "Runs daily at 06:00 UTC — outside UK trading hours"
+    },
+    {
+      "name": "complianceReport",
+      "type": "table",
+      "direction": "out",
+      "tableName": "ComplianceReports",
+      "connection": "AzureWebJobsStorage",
+      "comment": "Writes audit trail to Azure Table Storage"
+    }
+  ]
+}
